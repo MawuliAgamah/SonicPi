@@ -20,6 +20,8 @@ Requires:
 """
 
 import argparse
+import json
+import os
 import queue
 import struct
 import cv2
@@ -27,8 +29,9 @@ import numpy as np
 import fluidsynth
 import threading
 import time
+from pathlib import Path
 from picamera2 import Picamera2
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # ── Config ────────────────────────────────────────────────────
 
@@ -37,6 +40,9 @@ AUDIO_DRIVER = "alsa"
 AUDIO_DEVICE = "hw:2,0"
 STREAM_PORT = 8080
 FRAME_SIZE = (320, 240)
+GENERATED_MUSIC_DIR = Path(os.getenv("GENERATED_MUSIC_DIR", "generated_music"))
+MIDI_DIR = Path(os.getenv("MIDI_DIR", str(Path.home() / "midi"))).expanduser()
+MIDI_MANIFEST_PATH = os.getenv("MIDI_MANIFEST_PATH", "")
 
 # General MIDI instrument presets
 INSTRUMENTS = {
@@ -150,7 +156,10 @@ class FluidSynthEngine:
         # Channel 9 is drums by default in GM
 
         self.active_notes = {0: [], 1: [], 2: []}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.midi_player = None
+        self.midi_path = None
+        self.midi_playing = False
         self.current_params = {}
         self.running = True
 
@@ -186,8 +195,98 @@ class FluidSynthEngine:
             daemon=True
         ).start()
 
+    def all_notes_off(self):
+        """Silence generated notes and any sustained MIDI notes."""
+        with self.lock:
+            for channel in range(16):
+                self.fs.cc(channel, 123, 0)  # all notes off
+                self.fs.cc(channel, 120, 0)  # all sound off
+            for channel in list(self.active_notes):
+                self.active_notes[channel] = []
+
+    def is_midi_playing(self):
+        with self.lock:
+            return self.midi_playing
+
+    def apply_midi_feature_controls(self, features):
+        """Map camera features to global MIDI playback controls."""
+        if not features:
+            return
+
+        brightness = float(features.get('brightness', 128.0))
+        saturation = float(features.get('saturation', 80.0))
+        edge_density = float(features.get('edge_density', 0.05))
+        motion = float(features.get('motion', 0.0))
+
+        volume = int(45 + (brightness / 255.0) * 75)
+        expression = int(55 + min(1.0, (motion + edge_density * 120) / 35.0) * 72)
+        reverb = int(max(20, min(110, 95 - saturation / 3)))
+        chorus = int(max(10, min(95, saturation / 2)))
+
+        with self.lock:
+            for channel in range(16):
+                self.fs.cc(channel, 7, max(0, min(127, volume)))
+                self.fs.cc(channel, 11, max(0, min(127, expression)))
+                self.fs.cc(channel, 91, max(0, min(127, reverb)))
+                self.fs.cc(channel, 93, max(0, min(127, chorus)))
+
+    def play_midi_file(self, midi_path, features=None):
+        """Play a standard MIDI file through the current FluidSynth instance."""
+        path = Path(midi_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"MIDI file does not exist: {path}")
+        if not hasattr(fluidsynth, 'Player'):
+            raise RuntimeError("pyFluidSynth Player support is not available in this environment")
+
+        with self.lock:
+            self.stop_midi()
+            self.all_notes_off()
+            self.apply_midi_feature_controls(features)
+
+            player = fluidsynth.Player(self.fs)
+            if hasattr(player, 'add'):
+                player.add(str(path))
+            elif hasattr(player, 'add_file'):
+                player.add_file(str(path))
+            else:
+                raise RuntimeError("pyFluidSynth Player has no MIDI add method")
+            if not hasattr(player, 'play'):
+                raise RuntimeError("pyFluidSynth Player has no play method")
+            player.play()
+            self.midi_player = player
+            self.midi_path = path
+            self.midi_playing = True
+
+        threading.Thread(target=self._monitor_midi_player, args=(player,), daemon=True).start()
+        return path
+
+    def _monitor_midi_player(self, player):
+        try:
+            if hasattr(player, 'join'):
+                player.join()
+        finally:
+            with self.lock:
+                if self.midi_player is player:
+                    self.midi_playing = False
+
+    def stop_midi(self):
+        with self.lock:
+            player = self.midi_player
+            self.midi_player = None
+            self.midi_playing = False
+            self.midi_path = None
+
+        if player is not None:
+            if hasattr(player, 'stop'):
+                try:
+                    player.stop()
+                except Exception:
+                    pass
+            self.all_notes_off()
+
     def stop(self):
         self.running = False
+        self.stop_midi()
         for ch in self.active_notes:
             self.notes_off(ch)
         self.fs.delete()
@@ -346,6 +445,10 @@ def music_loop(synth):
     current_bass_inst = -1
 
     while synth.running:
+        if synth.is_midi_playing():
+            time.sleep(0.1)
+            continue
+
         params = synth.current_params
         if not params:
             time.sleep(0.1)
@@ -482,13 +585,25 @@ HTML_PAGE = """<!DOCTYPE html>
 body { background:#111; color:#eee; font-family:sans-serif; text-align:center; padding:20px; margin:0; }
 h1 { margin:0 0 16px; font-weight:300; letter-spacing:2px; }
 img { max-width:90%; border:2px solid #0f8; border-radius:4px; }
-audio { width:90%; max-width:640px; margin-top:20px; }
-pre { text-align:left; display:inline-block; font-size:12px; color:#8f8; }
+audio { width:90%; max-width:640px; margin-top:16px; }
+button { background:#0f8; border:0; border-radius:4px; color:#041; cursor:pointer; font-weight:700; margin:16px 8px 0; padding:10px 14px; }
+button:disabled { background:#465; color:#abc; cursor:wait; }
+pre { text-align:left; display:inline-block; font-size:12px; color:#8f8; max-width:90%; white-space:pre-wrap; }
+.status { color:#9cf; font-size:14px; margin-top:10px; min-height:20px; }
 </style></head>
 <body>
 <h1>CAMERA FLUID SYNTH</h1>
 <img src="/video" alt="camera stream"><br>
 <audio controls autoplay src="/audio">Audio streaming not supported in this browser.</audio>
+<br>
+<button id="generate">Generate music from camera</button>
+<button id="playMidi">Play matching MIDI</button>
+<button id="stopMidi">Stop MIDI</button>
+<div class="status" id="musicStatus"></div>
+<audio id="generatedAudio" controls></audio>
+<pre id="elevenlabs"></pre>
+<div class="status" id="midiStatus"></div>
+<pre id="midi"></pre>
 <pre id="feat"></pre>
 <script>
 async function tick() {
@@ -498,6 +613,81 @@ async function tick() {
   } catch(e) {}
 }
 setInterval(tick, 500);
+
+async function midiStatus() {
+  try {
+    const r = await fetch('/midi-status');
+    const data = await r.json();
+    document.getElementById('playMidi').disabled = data.state === 'running';
+    document.getElementById('midiStatus').innerText = data.message || data.state;
+    document.getElementById('midi').innerText = JSON.stringify({
+      file: data.filename,
+      mood: data.mood,
+      reason: data.reason,
+      description: data.description
+    }, null, 2);
+  } catch(e) {}
+}
+
+async function musicStatus() {
+  try {
+    const r = await fetch('/music-status');
+    const data = await r.json();
+    const button = document.getElementById('generate');
+    button.disabled = data.state === 'running';
+    document.getElementById('musicStatus').innerText = data.message || data.state;
+    document.getElementById('elevenlabs').innerText = JSON.stringify({
+      description: data.description,
+      prompt: data.prompt,
+      song_id: data.song_id,
+      model: data.model
+    }, null, 2);
+    if (data.audio_url) {
+      const audio = document.getElementById('generatedAudio');
+      if (audio.src.indexOf(data.audio_url) === -1) {
+        audio.src = data.audio_url;
+      }
+    }
+  } catch(e) {}
+}
+
+document.getElementById('generate').addEventListener('click', async () => {
+  const button = document.getElementById('generate');
+  button.disabled = true;
+  document.getElementById('musicStatus').innerText = 'Starting generation...';
+  try {
+    await fetch('/generate-music', {method: 'POST'});
+  } catch(e) {
+    document.getElementById('musicStatus').innerText = String(e);
+  }
+  musicStatus();
+});
+
+document.getElementById('playMidi').addEventListener('click', async () => {
+  const button = document.getElementById('playMidi');
+  button.disabled = true;
+  document.getElementById('midiStatus').innerText = 'Choosing MIDI...';
+  try {
+    await fetch('/play-midi', {method: 'POST'});
+  } catch(e) {
+    document.getElementById('midiStatus').innerText = String(e);
+  }
+  midiStatus();
+});
+
+document.getElementById('stopMidi').addEventListener('click', async () => {
+  try {
+    await fetch('/stop-midi', {method: 'POST'});
+  } catch(e) {
+    document.getElementById('midiStatus').innerText = String(e);
+  }
+  midiStatus();
+});
+
+setInterval(musicStatus, 1500);
+setInterval(midiStatus, 1000);
+musicStatus();
+midiStatus();
 </script>
 </body></html>"""
 
@@ -505,14 +695,167 @@ setInterval(tick, 500);
 # ── Video Stream ──────────────────────────────────────────────
 
 latest_frame = None
+latest_camera_frame = None
 latest_features = {}
 latest_music = {}
+synth_engine = None
 frame_lock = threading.Lock()
+generation_lock = threading.Lock()
+midi_lock = threading.Lock()
+generated_music_path = None
+generated_music_mime = "audio/mpeg"
+generation_status = {
+    "state": "idle",
+    "message": "Press Generate music from camera to create an ElevenLabs track.",
+    "description": "",
+    "prompt": "",
+    "song_id": "",
+    "model": "",
+    "audio_url": "",
+    "updated_at": "",
+}
+midi_status = {
+    "state": "idle",
+    "message": f"Put .mid files in {MIDI_DIR} and press Play matching MIDI.",
+    "filename": "",
+    "path": "",
+    "reason": "",
+    "description": "",
+    "mood": "",
+    "updated_at": "",
+}
+
+
+def update_generation_status(**fields):
+    with generation_lock:
+        generation_status.update(fields)
+        generation_status["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_generation_status():
+    with generation_lock:
+        return dict(generation_status)
+
+
+def update_midi_status(**fields):
+    with midi_lock:
+        midi_status.update(fields)
+        midi_status["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_midi_status():
+    with midi_lock:
+        return dict(midi_status)
+
+
+def generate_camera_music(snapshot, feature_snapshot):
+    global generated_music_path, generated_music_mime
+
+    try:
+        update_generation_status(
+            state="running",
+            message="Describing the camera image with OpenAI...",
+            description="",
+            prompt="",
+            song_id="",
+            model="",
+            audio_url="",
+        )
+
+        from module import (
+            build_elevenlabs_prompt,
+            describe_image,
+            generate_elevenlabs_music,
+            save_elevenlabs_music_result,
+        )
+
+        description_result = describe_image(snapshot, include_parts=True, max_parts=6)
+        prompt = build_elevenlabs_prompt(
+            description_result.description,
+            features=description_result.features or feature_snapshot,
+        )
+        update_generation_status(
+            message="Generating music with ElevenLabs...",
+            description=description_result.description,
+            prompt=prompt,
+        )
+
+        result = generate_elevenlabs_music(prompt)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        saved = save_elevenlabs_music_result(result, GENERATED_MUSIC_DIR, stem=f"camera_{timestamp}")
+        audio_path = saved.get("audio")
+        if audio_path is None:
+            raise RuntimeError("ElevenLabs response did not include audio data")
+
+        with generation_lock:
+            generated_music_path = audio_path
+            generated_music_mime = result.mime_type
+
+        update_generation_status(
+            state="complete",
+            message=f"Generated {audio_path.name}",
+            song_id=result.song_id or "",
+            model=result.model_id,
+            audio_url=f"/generated-music?t={int(time.time())}",
+        )
+    except Exception as exc:
+        update_generation_status(
+            state="error",
+            message=f"Music generation failed: {exc}",
+        )
+
+
+def select_and_play_camera_midi(snapshot, feature_snapshot):
+    try:
+        if synth_engine is None:
+            raise RuntimeError("FluidSynth engine is not ready")
+
+        update_midi_status(
+            state="running",
+            message="Describing image and choosing a MIDI file...",
+            filename="",
+            path="",
+            reason="",
+            description="",
+            mood="",
+        )
+
+        from module import choose_midi_for_image
+
+        manifest_path = MIDI_MANIFEST_PATH or None
+        selection = choose_midi_for_image(
+            snapshot,
+            MIDI_DIR,
+            features=feature_snapshot,
+            manifest_path=manifest_path,
+        )
+        played_path = synth_engine.play_midi_file(selection.path, features=feature_snapshot)
+        update_midi_status(
+            state="playing",
+            message=f"Playing {selection.filename}",
+            filename=selection.filename,
+            path=str(played_path),
+            reason=selection.reason,
+            description=selection.image_description,
+            mood=selection.mood,
+        )
+    except Exception as exc:
+        update_midi_status(
+            state="error",
+            message=f"MIDI selection/playback failed: {exc}",
+        )
+
 
 class StreamHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/features':
             return self._serve_features()
+        if self.path == '/music-status':
+            return self._serve_music_status()
+        if self.path == '/midi-status':
+            return self._serve_midi_status()
+        if self.path.startswith('/generated-music'):
+            return self._serve_generated_music()
         if self.path == '/audio' and audio_broadcaster is not None:
             return self._serve_audio()
         if self.path == '/' and audio_broadcaster is not None:
@@ -520,11 +863,24 @@ class StreamHandler(BaseHTTPRequestHandler):
         # '/' (non-browser mode) and '/video' both serve the MJPEG stream
         return self._serve_video()
 
-    def _serve_features(self):
-        self.send_response(200)
+    def do_POST(self):
+        if self.path == '/generate-music':
+            return self._start_music_generation()
+        if self.path == '/play-midi':
+            return self._start_midi_selection()
+        if self.path == '/stop-midi':
+            return self._stop_midi()
+        self.send_error(404)
+
+    def _send_json(self, data, status=200):
+        body = json.dumps(data).encode()
+        self.send_response(status)
         self.send_header('Content-type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
-        import json
+        self.wfile.write(body)
+
+    def _serve_features(self):
         with frame_lock:
             data = {
                 'features': {k: round(v, 2) if isinstance(v, float) else v
@@ -532,7 +888,80 @@ class StreamHandler(BaseHTTPRequestHandler):
                 'music': {k: v for k, v in latest_music.items()
                           if k not in ('scale_notes',)},
             }
-        self.wfile.write(json.dumps(data).encode())
+        self._send_json(data)
+
+    def _serve_music_status(self):
+        self._send_json(get_generation_status())
+
+    def _serve_midi_status(self):
+        status = get_midi_status()
+        if synth_engine is not None and status.get("state") == "playing" and not synth_engine.is_midi_playing():
+            update_midi_status(state="idle", message="MIDI playback finished.")
+            status = get_midi_status()
+        self._send_json(status)
+
+    def _start_music_generation(self):
+        with generation_lock:
+            if generation_status["state"] == "running":
+                return self._send_json(get_generation_status(), status=409)
+
+        with frame_lock:
+            if latest_camera_frame is None:
+                return self._send_json({"state": "error", "message": "No camera frame is available yet"}, status=503)
+            snapshot = latest_camera_frame.copy()
+            feature_snapshot = dict(latest_features)
+
+        update_generation_status(state="running", message="Queued music generation...")
+        thread = threading.Thread(
+            target=generate_camera_music,
+            args=(snapshot, feature_snapshot),
+            daemon=True,
+        )
+        thread.start()
+        self._send_json(get_generation_status(), status=202)
+
+    def _start_midi_selection(self):
+        with midi_lock:
+            if midi_status["state"] == "running":
+                return self._send_json(get_midi_status(), status=409)
+
+        with frame_lock:
+            if latest_camera_frame is None:
+                return self._send_json({"state": "error", "message": "No camera frame is available yet"}, status=503)
+            snapshot = latest_camera_frame.copy()
+            feature_snapshot = dict(latest_features)
+
+        update_midi_status(state="running", message="Queued MIDI selection...")
+        thread = threading.Thread(
+            target=select_and_play_camera_midi,
+            args=(snapshot, feature_snapshot),
+            daemon=True,
+        )
+        thread.start()
+        self._send_json(get_midi_status(), status=202)
+
+    def _stop_midi(self):
+        if synth_engine is not None:
+            synth_engine.stop_midi()
+        update_midi_status(state="idle", message="MIDI playback stopped.")
+        self._send_json(get_midi_status())
+
+    def _serve_generated_music(self):
+        with generation_lock:
+            path = generated_music_path
+            mime_type = generated_music_mime
+
+        if path is None or not Path(path).exists():
+            self.send_error(404, "No generated music yet")
+            return
+
+        data = Path(path).read_bytes()
+        self.send_response(200)
+        self.send_header('Content-type', mime_type)
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-cache, no-store')
+        self.end_headers()
+        self.wfile.write(data)
 
     def _serve_html(self):
         body = HTML_PAGE.encode()
@@ -725,13 +1154,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Camera Fluid Synth")
     parser.add_argument('--browser', action='store_true',
                         help='Stream audio to the browser instead of the Pi audio jack')
+    parser.add_argument('--midi-dir', default=str(MIDI_DIR),
+                        help='Folder of .mid/.midi files for OpenAI-selected playback')
+    parser.add_argument('--midi-manifest', default=MIDI_MANIFEST_PATH,
+                        help='Optional path to midi_manifest.json metadata')
     return parser.parse_args()
 
 
 def main():
-    global latest_frame, latest_features, latest_music, audio_broadcaster
+    global latest_frame, latest_camera_frame, latest_features, latest_music, audio_broadcaster
+    global synth_engine, MIDI_DIR, MIDI_MANIFEST_PATH
 
     args = parse_args()
+    MIDI_DIR = Path(args.midi_dir).expanduser()
+    MIDI_MANIFEST_PATH = str(Path(args.midi_manifest).expanduser()) if args.midi_manifest else ""
+    update_midi_status(message=f"Put .mid files in {MIDI_DIR} and press Play matching MIDI.")
 
     print("Starting Camera Fluid Synth...")
     print("=" * 50)
@@ -743,6 +1180,7 @@ def main():
 
     # Init synth
     synth = FluidSynthEngine(browser_mode=args.browser)
+    synth_engine = synth
     print(f"[OK] FluidSynth started (output: {'browser' if args.browser else 'alsa ' + AUDIO_DEVICE})")
 
     # In browser mode, render samples and fan them out to HTTP clients
@@ -758,7 +1196,7 @@ def main():
     print("[OK] Music loop started")
 
     # Start HTTP stream
-    http_server = HTTPServer(('0.0.0.0', STREAM_PORT), StreamHandler)
+    http_server = ThreadingHTTPServer(('0.0.0.0', STREAM_PORT), StreamHandler)
     http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
     http_thread.start()
     if args.browser:
@@ -766,6 +1204,8 @@ def main():
         print(f"[OK] Audio WAV stream at /audio, video at /video")
     else:
         print(f"[OK] Video stream at http://<pi-ip>:{STREAM_PORT}")
+    print(f"[OK] MIDI library: {MIDI_DIR}")
+    print(f"[OK] MIDI manifest: {MIDI_MANIFEST_PATH or MIDI_DIR / 'midi_manifest.json'}")
     print(f"[OK] Features JSON at http://<pi-ip>:{STREAM_PORT}/features")
     print("=" * 50)
     print("Point the camera around! Ctrl+C to stop.\n")
@@ -786,6 +1226,7 @@ def main():
 
             with frame_lock:
                 latest_frame = display_frame
+                latest_camera_frame = frame.copy()
                 latest_features = features
                 latest_music = music_params
 

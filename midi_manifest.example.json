@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "tracks": [
+    {
+      "file": "moonlight-sonata.mid",
+      "title": "Moonlight Sonata",
+      "composer": "Ludwig van Beethoven",
+      "style": "classical piano",
+      "mood": "dark, reflective, intimate",
+      "energy": "low",
+      "tags": ["night", "melancholy", "solo piano", "slow"],
+      "notes": "Good for dim scenes, calm portraits, shadows, or quiet indoor images."
+    },
+    {
+      "file": "fur-elise.mid",
+      "title": "Fur Elise",
+      "composer": "Ludwig van Beethoven",
+      "style": "classical piano",
+      "mood": "playful, elegant, familiar",
+      "energy": "medium",
+      "tags": ["piano", "light", "classic", "motion"],
+      "notes": "Good for balanced scenes with people, objects, or gentle motion."
+    },
+    {
+      "file": "bach-cello-suite1-prelude.mid",
+      "title": "Cello Suite No. 1 Prelude",
+      "composer": "J. S. Bach",
+      "style": "baroque strings",
+      "mood": "warm, flowing, grounded",
+      "energy": "medium",
+      "tags": ["strings", "organic", "warm", "flowing"],
+      "notes": "Good for natural textures, wood, plants, warm colors, or structured compositions."
+    },
+    {
+      "file": "bright-dance.mid",
+      "title": "Bright Dance",
+      "composer": "Unknown",
+      "style": "dance",
+      "mood": "bright, energetic, celebratory",
+      "energy": "high",
+      "tags": ["dance", "fast", "colorful", "movement"],
+      "notes": "Good for saturated images, busy edges, movement, or bright outdoor scenes."
+    }
+  ]
+}
