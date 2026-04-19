@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +20,7 @@ DEFAULT_DRUM_DIR = Path("midi/dmp_drum_patterns")
 DEFAULT_ARRANGEMENT_DIR = Path("generated_arrangements")
 DEFAULT_PORT = 8090
 FRAME_INTERVAL = 0.05
+DEFAULT_FLUIDSYNTH_AUDIO_DRIVER = "coreaudio" if sys.platform == "darwin" else "alsa"
 COMMON_SOUNDFONT_PATHS = [
     "/opt/homebrew/share/fluid-soundfont/FluidR3_GM.sf2",
     "/usr/local/share/fluid-soundfont/FluidR3_GM.sf2",
@@ -90,32 +92,42 @@ refreshStatus();
 
 
 class MidiPlayer:
-    """Small macOS-friendly MIDI playback wrapper."""
+    """Small local MIDI playback wrapper."""
 
-    def __init__(self, soundfont: str | None = None, prefer_fluidsynth: bool = True):
+    def __init__(
+        self,
+        soundfont: str | None = None,
+        prefer_fluidsynth: bool = True,
+        audio_driver: str = DEFAULT_FLUIDSYNTH_AUDIO_DRIVER,
+        rendered_audio_dir: str | Path = "generated_arrangements/rendered_audio",
+    ):
         if soundfont:
             self.soundfont = Path(soundfont).expanduser()
             self.soundfont_log = [f"--soundfont provided: {self.soundfont}"]
         else:
             self.soundfont, self.soundfont_log = detect_soundfont()
         self.prefer_fluidsynth = prefer_fluidsynth
+        self.audio_driver = audio_driver
+        self.rendered_audio_dir = Path(rendered_audio_dir).expanduser()
         self.process: subprocess.Popen[bytes] | None = None
         print("[soundfont] detection log:", flush=True)
         for line in self.soundfont_log:
             print(f"[soundfont] {line}", flush=True)
 
-    def play(self, midi_path: str | Path) -> str:
+    def play(self, midi_path: str | Path, *, soundfont: str | Path | None = None) -> str:
         path = Path(midi_path).expanduser()
         if not path.exists():
             raise FileNotFoundError(f"MIDI file does not exist: {path}")
+
+        active_soundfont = Path(soundfont).expanduser() if soundfont else self.soundfont
 
         self.stop()
         fluidsynth_bin = shutil.which("fluidsynth")
         print(f"[midi] selected file: {path}", flush=True)
         print(f"[fluidsynth] executable: {fluidsynth_bin or 'not found'}", flush=True)
-        print(f"[fluidsynth] soundfont: {self.soundfont or 'not found'}", flush=True)
-        if self.prefer_fluidsynth and fluidsynth_bin and self.soundfont and self.soundfont.exists():
-            command = [fluidsynth_bin, "-a", "coreaudio", str(self.soundfont), str(path)]
+        print(f"[fluidsynth] soundfont: {active_soundfont or 'not found'}", flush=True)
+        if self.prefer_fluidsynth and fluidsynth_bin and active_soundfont and active_soundfont.exists():
+            command = [fluidsynth_bin, "-a", self.audio_driver, str(active_soundfont), str(path)]
             print(f"[fluidsynth] command: {' '.join(command)}", flush=True)
             self.process = subprocess.Popen(
                 command,
@@ -127,17 +139,64 @@ class MidiPlayer:
                 _, stderr = self.process.communicate(timeout=1)
                 self.process = None
                 error = stderr.decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"FluidSynth failed to start: {error or 'unknown error'}")
-            return f"Playing with FluidSynth: {path.name}"
+                print(f"[fluidsynth] realtime playback failed: {error or 'unknown error'}", flush=True)
+                fallback = self._render_audio_fallback(
+                    path,
+                    active_soundfont=active_soundfont,
+                    fluidsynth_bin=fluidsynth_bin,
+                )
+                return (
+                    "FluidSynth could not open the live audio device, so it rendered "
+                    f"and opened audio instead: {fallback.name}"
+                )
+            return f"Playing with FluidSynth ({active_soundfont.name}): {path.name}"
 
         subprocess.Popen(["open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if self.prefer_fluidsynth and fluidsynth_bin and not self.soundfont:
+        if self.prefer_fluidsynth and fluidsynth_bin and not active_soundfont:
             return "Opened MIDI in macOS. FluidSynth is installed, but no SoundFont was found. Install fluid-soundfont or pass --soundfont PATH."
-        if self.prefer_fluidsynth and fluidsynth_bin and self.soundfont and not self.soundfont.exists():
-            return f"Opened MIDI in macOS. SoundFont path does not exist: {self.soundfont}"
+        if self.prefer_fluidsynth and fluidsynth_bin and active_soundfont and not active_soundfont.exists():
+            return f"Opened MIDI in macOS. SoundFont path does not exist: {active_soundfont}"
         if self.prefer_fluidsynth and not fluidsynth_bin:
             return "Opened MIDI in macOS. Install fluidsynth to audition through the target synth."
         return f"Opened MIDI: {path.name}"
+
+    def _render_audio_fallback(
+        self,
+        midi_path: Path,
+        *,
+        active_soundfont: Path,
+        fluidsynth_bin: str,
+    ) -> Path:
+        """Render MIDI to WAV when realtime CoreAudio/PortAudio cannot start."""
+
+        self.rendered_audio_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = self.rendered_audio_dir / f"{midi_path.stem}_{time.strftime('%Y%m%d-%H%M%S')}.wav"
+        command = [
+            fluidsynth_bin,
+            "-ni",
+            "-q",
+            "-F",
+            str(audio_path),
+            "-T",
+            "wav",
+            str(active_soundfont),
+            str(midi_path),
+        ]
+        print(f"[fluidsynth] render fallback command: {' '.join(command)}", flush=True)
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=90,
+        )
+        if result.returncode != 0:
+            error = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise RuntimeError(f"FluidSynth realtime and render fallback both failed: {error}")
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(audio_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return audio_path
 
     def stop(self) -> None:
         if self.process and self.process.poll() is None:
@@ -163,6 +222,8 @@ class MacWebApp:
         tempo_bpm: int,
         chord_program: int | None,
         player: MidiPlayer,
+        soundfont_dir: str | Path | None = None,
+        soundfont_manifest: str | Path | None = None,
         save_snapshot_dir: str | Path | None = None,
     ):
         self.cv2 = import_cv2()
@@ -179,6 +240,10 @@ class MacWebApp:
         self.tempo_bpm = tempo_bpm
         self.chord_program = chord_program
         self.player = player
+        self.soundfont_dir = Path(soundfont_dir).expanduser() if soundfont_dir else None
+        self.soundfont_manifest = (
+            Path(soundfont_manifest).expanduser() if soundfont_manifest else None
+        )
         self.save_snapshot_dir = Path(save_snapshot_dir).expanduser() if save_snapshot_dir else None
         self.latest_frame = None
         self.frame_lock = threading.Lock()
@@ -321,41 +386,89 @@ class MacWebApp:
 
     def _select_arrange_and_play(self, snapshot) -> None:
         try:
+            from concurrent.futures import ThreadPoolExecutor
+
             from module import (
-                choose_midi_for_image,
-                create_chord_drum_arrangement,
+                choose_midi_from_description,
+                create_full_arrangement,
                 default_arrangement_path,
+                describe_image,
+                list_midi_files,
             )
             from module.image_describer import extract_features
+            from module.soundfont_picker import (
+                load_soundfont_manifest,
+                pick_soundfont,
+            )
 
             features, _, _ = extract_features(snapshot)
-            self._set_status(state="running", message="Choosing chord progression...")
-            chord_selection = choose_midi_for_image(
-                snapshot,
-                self.midi_dir,
-                features=features,
-                manifest_path=self.midi_manifest,
-            )
 
-            self._set_status(state="running", message="Choosing drum pattern...")
-            drum_selection = choose_midi_for_image(
-                snapshot,
-                self.drum_dir,
-                features=features,
-                manifest_path=self.drum_manifest,
-            )
+            self._set_status(state="running", message="Describing image with OpenAI...")
+            description = describe_image(snapshot, include_parts=True, max_parts=4)
 
-            self._set_status(state="running", message="Arranging chords with drums...")
-            result = create_chord_drum_arrangement(
+            chord_candidates = list_midi_files(self.midi_dir, manifest_path=self.midi_manifest)
+            drum_candidates = list_midi_files(self.drum_dir, manifest_path=self.drum_manifest)
+            if not chord_candidates:
+                raise FileNotFoundError(f"No chord MIDI files found in {self.midi_dir}")
+            if not drum_candidates:
+                raise FileNotFoundError(f"No drum MIDI files found in {self.drum_dir}")
+
+            self._set_status(state="running", message="Choosing chord + drum MIDI in parallel...")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                chord_future = pool.submit(
+                    choose_midi_from_description,
+                    description.description,
+                    chord_candidates,
+                    features=features,
+                )
+                drum_future = pool.submit(
+                    choose_midi_from_description,
+                    description.description,
+                    drum_candidates,
+                    features=features,
+                )
+                chord_selection = chord_future.result()
+                drum_selection = drum_future.result()
+
+            self._set_status(state="running", message="Building vibe-driven arrangement...")
+            result = create_full_arrangement(
                 chord_selection.path,
                 drum_selection.path,
                 default_arrangement_path(self.arrangement_dir),
+                features=features,
                 tempo_bpm=self.tempo_bpm,
                 target_seconds=self.target_seconds,
-                chord_program=self.chord_program,
             )
+
+            soundfont_selection = None
+            if self.soundfont_dir is not None:
+                entries = load_soundfont_manifest(
+                    self.soundfont_dir,
+                    manifest_path=self.soundfont_manifest,
+                )
+                soundfont_selection = pick_soundfont(
+                    result.vibe,
+                    entries,
+                    fallback=self.player.soundfont,
+                )
+
             self.last_midi_path = result.output_path
-            message = self.player.play(result.output_path)
+            soundfont_path = (
+                soundfont_selection.entry.path if soundfont_selection else None
+            )
+            message = self.player.play(result.output_path, soundfont=soundfont_path)
+            arrangement = {
+                "chords": chord_selection.filename,
+                "drums": drum_selection.filename,
+                **result.summary(),
+            }
+            if soundfont_selection is not None:
+                arrangement["soundfont"] = {
+                    "name": soundfont_selection.entry.name,
+                    "path": str(soundfont_selection.entry.path),
+                    "bucket": soundfont_selection.bucket,
+                    "reason": soundfont_selection.reason,
+                }
             self._set_status(
                 state="playing",
                 message=message,
@@ -363,16 +476,8 @@ class MacWebApp:
                 path=str(result.output_path),
                 mood=f"{chord_selection.mood} + {drum_selection.mood}",
                 reason=f"Chords: {chord_selection.reason} Drums: {drum_selection.reason}",
-                description=chord_selection.image_description,
-                arrangement={
-                    "chords": chord_selection.filename,
-                    "drums": drum_selection.filename,
-                    "output": str(result.output_path),
-                    "tempo_bpm": result.tempo_bpm,
-                    "target_seconds": result.target_seconds,
-                    "chord_repeats": result.chord_repeats,
-                    "drum_repeats": result.drum_repeats,
-                },
+                description=description.description,
+                arrangement=arrangement,
             )
         except Exception as exc:
             self._set_status(state="error", message=f"Arrangement failed: {exc}")
@@ -540,7 +645,7 @@ def detect_soundfont() -> tuple[Path | None, list[str]]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Browser UI for camera-to-MIDI selection on macOS")
+    parser = argparse.ArgumentParser(description="Browser UI for camera-to-MIDI arrangement playback")
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV webcam index")
     parser.add_argument("--host", default="127.0.0.1", help="HTTP host")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP port")
@@ -552,8 +657,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-seconds", type=int, default=60, help="Arrangement target duration")
     parser.add_argument("--tempo-bpm", type=int, default=110, help="Arrangement tempo")
     parser.add_argument("--chord-program", type=int, default=0, help="General MIDI program for chord layer; use -1 to preserve")
-    parser.add_argument("--soundfont", default=os.getenv("SOUNDFONT_PATH"), help="SoundFont for local FluidSynth playback")
-    parser.add_argument("--no-fluidsynth", action="store_true", help="Always open MIDI with the default macOS app")
+    parser.add_argument("--soundfont", default=os.getenv("SOUNDFONT_PATH"), help="Default SoundFont when no vibe-matched bank is available")
+    parser.add_argument("--soundfont-dir", default="soundfonts", help="Folder of .sf2 banks for vibe-driven selection")
+    parser.add_argument("--soundfont-manifest", help="Optional soundfont_manifest.json path; defaults to <soundfont-dir>/soundfont_manifest.json")
+    parser.add_argument(
+        "--rendered-audio-dir",
+        default="generated_arrangements/rendered_audio",
+        help="Where WAV fallback renders are saved if live FluidSynth audio fails",
+    )
+    parser.add_argument(
+        "--fluidsynth-audio-driver",
+        default=DEFAULT_FLUIDSYNTH_AUDIO_DRIVER,
+        help="FluidSynth audio driver, e.g. coreaudio on macOS or alsa on Raspberry Pi",
+    )
+    parser.add_argument("--no-fluidsynth", action="store_true", help="Do not use FluidSynth for MIDI playback")
     parser.add_argument("--save-snapshots", help="Optional folder for captured webcam snapshots")
     parser.add_argument("--env-file", default=".env", help="Optional env file containing OPENAI_API_KEY")
     return parser
@@ -576,7 +693,14 @@ def main() -> None:
         target_seconds=args.target_seconds,
         tempo_bpm=args.tempo_bpm,
         chord_program=None if args.chord_program < 0 else args.chord_program,
-        player=MidiPlayer(soundfont=args.soundfont, prefer_fluidsynth=not args.no_fluidsynth),
+        player=MidiPlayer(
+            soundfont=args.soundfont,
+            prefer_fluidsynth=not args.no_fluidsynth,
+            audio_driver=args.fluidsynth_audio_driver,
+            rendered_audio_dir=args.rendered_audio_dir,
+        ),
+        soundfont_dir=args.soundfont_dir,
+        soundfont_manifest=args.soundfont_manifest,
         save_snapshot_dir=args.save_snapshots,
     )
     app.start_camera()

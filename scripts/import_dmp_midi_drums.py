@@ -28,7 +28,7 @@ GM_DRUM_MAP = {
     "LowTom": 45,
     "MediumTom": 47,
     "HighTom": 50,
-    "Cymbal": 49,
+    "Cymbal": 51,
     "Cowbell": 56,
     "Tambourine": 54,
 }

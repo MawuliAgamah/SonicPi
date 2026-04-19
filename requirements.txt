@@ -2,4 +2,5 @@ numpy
 opencv-python
 pyfluidsynth
 mido
+music21
 picamera2; platform_machine == "aarch64" or platform_machine == "armv7l"

@@ -51,7 +51,27 @@ result = describe_image("path/to/image.jpg")
 print(result.description)
 ```
 
-## Root entrypoint
+## Unified launcher
+
+Use `app.py` on the Pi when you want to choose one pipeline:
+
+```bash
+python3 app.py ambient --host 0.0.0.0 --port 8091 --camera-index 0
+python3 app.py llm --camera-index 0 --output-dir generated_music
+python3 app.py arrangement --host 0.0.0.0 --port 8090 --camera-index 0
+```
+
+The `llm` mode captures a camera snapshot itself by default. It saves the
+snapshot in `captured_images/`, describes it with OpenAI, generates music with
+ElevenLabs, then writes audio and metadata to `generated_music/`.
+
+For offline testing without camera hardware, pass an image explicitly:
+
+```bash
+python3 app.py llm --image path/to/image.jpg --output-dir generated_music
+```
+
+## Root image entrypoint
 
 Use `main.py` when you want one place to orchestrate the full image-to-music flow:
 
@@ -113,6 +133,71 @@ export GENERATED_MUSIC_DIR="generated_music"
 ## Camera-selected MIDI playback
 
 You can also keep a folder of premade `.mid` files and let OpenAI choose which one FluidSynth should play based on the current camera image.
+
+## Camera-driven ambient synthesis
+
+`ambient.py` is a separate API-free path for continuous ambient sound. It uses the webcam and OpenCV feature extraction, smooths the image-derived vibe over a few seconds, and controls a long-running synth instead of generating MIDI files.
+
+The default engine is `sounddevice` + NumPy. It streams generated audio buffers directly through PortAudio and is the lowest-friction ambient engine:
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-ambient.txt
+```
+
+On macOS, install PortAudio if `sounddevice` cannot find an output device:
+
+```bash
+brew install portaudio
+```
+
+On Raspberry Pi OS / Debian:
+
+```bash
+sudo apt install portaudio19-dev libportaudio2
+```
+
+Run the ambient browser controller:
+
+```bash
+python3 ambient.py --camera-index 0 --port 8091
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8091/
+```
+
+Useful options:
+
+```bash
+python3 ambient.py --engine sounddevice
+python3 ambient.py --engine sounddevice --sample-rate 32000 --blocksize 1024
+python3 ambient.py --engine sounddevice --audio-device 1
+```
+
+Browser controls:
+
+- `Start`: starts local audio output
+- `Hold`: freezes the current smoothed vibe while the camera keeps running
+- `Reset key`: chooses a new modal key from the current vibe
+- `Stop`: stops the audio engine
+
+This path does not use OpenAI, ElevenLabs, FluidSynth, SoundFonts, or local MIDI libraries. It keeps one modal key per session unless you press `Reset key`. Pads and drones are always present; sparse arpeggio and texture layers can be disabled:
+
+```bash
+python3 ambient.py --no-arpeggio --no-texture
+```
+
+pyo is still available as an optional engine, but it is not the default because it often requires a compiler toolchain:
+
+```bash
+xcode-select --install
+brew install portaudio portmidi liblo libsndfile
+pip install -r requirements-pyo.txt
+python3 ambient.py --engine pyo
+```
 
 ### Test on macOS first
 
@@ -203,7 +288,7 @@ OpenHiHat    -> 46
 LowTom       -> 45
 MediumTom    -> 47
 HighTom      -> 50
-Cymbal       -> 49
+Cymbal       -> 51
 Cowbell      -> 56
 Tambourine   -> 54
 ```
